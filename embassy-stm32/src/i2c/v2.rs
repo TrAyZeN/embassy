@@ -1581,6 +1581,7 @@ impl<'d, M: Mode> I2c<'d, M, MultiMaster> {
         let last_chunk_idx = total_chunks.saturating_sub(1);
         let total_len = read.len();
         let mut remaining_len = total_len;
+        let mut stop_received = false;
 
         for (number, chunk) in read.chunks_mut(255).enumerate() {
             trace!(
@@ -1588,6 +1589,12 @@ impl<'d, M: Mode> I2c<'d, M, MultiMaster> {
                 number,
                 chunk.len()
             );
+
+            // Stop has been received before the end of a chunk, stop receiving data
+            if stop_received {
+                break;
+            }
+
             if number == 0 {
                 Self::slave_start(self.info, chunk.len(), number != last_chunk_idx);
             } else {
@@ -1605,7 +1612,10 @@ impl<'d, M: Mode> I2c<'d, M, MultiMaster> {
             for byte in chunk {
                 // Wait until we have received something
                 match self.wait_rxne(timeout) {
-                    Ok(ReceiveResult::StopReceived) => {}
+                    Ok(ReceiveResult::StopReceived) => {
+                        stop_received = true;
+                        break;
+                    }
                     Ok(ReceiveResult::NewStart) => {
                         trace!("--- Slave RX transmission end (early)");
                         return Ok(total_len - remaining_len); // Return N bytes read
@@ -1622,6 +1632,29 @@ impl<'d, M: Mode> I2c<'d, M, MultiMaster> {
                 };
             }
         }
+
+        // Discard the excess bytes received beyond buffer length
+        let mut discarded_bytes = 0;
+        loop {
+            match self.wait_rxne(timeout) {
+                Ok(ReceiveResult::StopReceived) => {
+                    break;
+                }
+                Ok(ReceiveResult::NewStart) => {
+                    trace!("--- Slave RX transmission end");
+                    return Ok(total_len - remaining_len); // Return N bytes read
+                }
+                Ok(ReceiveResult::DataAvailable) => {
+                    let _ = self.info.regs.rxdr().read().rxdata();
+                    discarded_bytes += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        if discarded_bytes > 0 {
+            trace!("Discarded {} excess bytes", discarded_bytes);
+        }
+
         self.wait_stop_or_err(timeout)?;
 
         trace!("--- Slave RX transmission end");
@@ -1726,7 +1759,9 @@ impl<'d, M: Mode> I2c<'d, M, MultiMaster> {
         }
     }
 
-    /// Respond to a write command.
+    /// Respond to a write command by reading data.
+    ///
+    /// Data received beyond the length of the provided buffer are acknowledged but discarded.
     ///
     /// Returns total number of bytes received.
     pub fn blocking_respond_to_write(&self, read: &mut [u8]) -> Result<usize, Error> {
@@ -1734,7 +1769,7 @@ impl<'d, M: Mode> I2c<'d, M, MultiMaster> {
         self.slave_read_internal(read, timeout)
     }
 
-    /// Respond to a read command.
+    /// Respond to a read command by transmitting data.
     pub fn blocking_respond_to_read(&mut self, write: &[u8]) -> Result<(), Error> {
         let timeout = self.timeout();
         self.slave_write_internal(write, timeout)
@@ -1768,7 +1803,7 @@ impl<'d> I2c<'d, Async, MultiMaster> {
         .await
     }
 
-    /// Respond to a write command.
+    /// Respond to a write command by receiving data.
     ///
     /// Returns the total number of bytes received.
     pub async fn respond_to_write(&mut self, buffer: &mut [u8]) -> Result<usize, Error> {
@@ -1777,7 +1812,7 @@ impl<'d> I2c<'d, Async, MultiMaster> {
         timeout.with(self.read_dma_internal_slave(buffer, timeout)).await
     }
 
-    /// Respond to a read request from an I2C master.
+    /// Respond to a read request by transmitting data.
     pub async fn respond_to_read(&mut self, write: &[u8]) -> Result<SendStatus, Error> {
         let _scoped_block_stop = self.info.rcc.block_stop();
         let timeout = self.timeout();
